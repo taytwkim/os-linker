@@ -1,23 +1,54 @@
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <string.h>
 #include <string>
-#include <unordered_map>
 
+/* 
+ * Implement a two-pass linker.
+ * 
+ * The first pass scans the input file and builds the
+ * module_base_table and the symbol_table.
+ * 
+ * get_token() and read* are helper functions used in
+ * both passes to consume one token at a time from the
+ * file stream. 
+ */
+
+// File state
 FILE *fp;
 int linenum;
 int curr_line_offset;
+
+// Helpful in finding the EOF offset
 int end_of_line_offset;
 
-// Map module # to module base
-std::unordered_map<int, int> module_base_table;
+// Map module # -> module base, updated after first pass
+std::map<int, int> module_base_table;
 
-// Map symbol to absolute address
-std::unordered_map<std::string, int> absolute_addr_table;
+// Map symbol -> absolute address, updated after first pass
+std::map<std::string, int> symbol_table;
 
+/*
+ * Read and return one token at a time from a file stream.
+ * 
+ * Delimiters are space, tab, and new line.
+ * 
+ * File state is maintained as a global fp variable.
+ * 
+ * Return nullptr if we reached EOF and there is no token to read.
+ * 
+ * linenum and curr_line_offset are updated after each call 
+ * to the position of the first character of the token.
+ * 
+ * If we are at EOF, they are set to one past the position of the 
+ * last character in the file.
+ */
 char *getToken()
 {
+    // Static variables are not reset at each call
     static char *line;
     static char *pch;
     static size_t capacity;
@@ -43,9 +74,13 @@ char *getToken()
         }
     }
 
+    // If we are at the end of line, pch could be nullptr
     pch = std::strtok(nullptr, delim);
 
     if (pch == nullptr) {
+        // If we are at the end of line,
+        // we have to find and return the next valid line/token
+        // instead of returning nullptr.
         return getToken();
     }
 
@@ -54,6 +89,8 @@ char *getToken()
     return pch;
 }
 
+// Read one token and return an integer value
+// Return -1 if we reached EOF
 int readInt()
 {
     char *tok = getToken();
@@ -66,6 +103,8 @@ int readInt()
     return std::stoi(tok);
 }
 
+// Read one symbol and return a string value
+// Return nullopt if we reached EOF
 std::optional<std::string> readSym()
 {
     char *tok = getToken();
@@ -78,6 +117,8 @@ std::optional<std::string> readSym()
     return s;
 }
 
+// Return one address mode (M, A, R, I, E)
+// Return nullopt if we reached EOF
 std::optional<char> readMARIE()
 {
     char *tok = getToken();
@@ -90,28 +131,32 @@ std::optional<char> readMARIE()
     return *tok;
 }
 
+// Make first pass over the input file.
+// Builds module_base_table and symbol table
+// needed in the second pass.
 void pass1()
 {
     int module_num = 0;
     int module_base = 0;
 
+    // One iteration corresponds to one module
     while (true) {
         int defcount = readInt();
 
         if (defcount < 0) {
-            exit(2);
+            return;
         }
 
         for (int i = 0; i < defcount; ++i) {
             std::string sym = readSym().value_or("EOF");
 
             if (sym == "EOF") {
-                exit(2);
+                return;
             }
 
             int val = readInt();
             
-            absolute_addr_table[sym] = module_base + val;
+            symbol_table[sym] = module_base + val;
         }
 
         int useCount = readInt();
@@ -120,7 +165,7 @@ void pass1()
             std::string sym = readSym().value_or("EOF");
 
             if (sym == "EOF") {
-                exit(2);
+                return;
             }
         }
 
@@ -130,7 +175,8 @@ void pass1()
             char addressMode = readMARIE().value_or('F');
             
             if (addressMode == 'F') {
-                exit(2);
+                // F means EOF
+                return;
             }
             
             int operand = readInt();
@@ -142,10 +188,23 @@ void pass1()
     }
 }
 
-void print_pass1_results()
-{
-    std::cout << "Hello World!" << "\n";
-}
+// void print_pass1_results()
+// {
+//     std::cout << "\nPass 1 Results: \n";
+
+//     std::cout << "\nModule Base Table: \n";
+
+//     for (auto [mod_num, mod_base] : module_base_table) {
+//         std::cout << mod_num << ": " << mod_base << "\n";
+//     }
+
+//     std::cout << "\nSymbol Table: \n";
+
+//     for (auto [sym, addr] : symbol_table) {
+//         std::cout << sym << ": " << addr << "\n";
+//     }
+
+// }
 
 int main (int argc, char *argv[])
 {
@@ -164,7 +223,9 @@ int main (int argc, char *argv[])
     }
     
     pass1();
-    print_pass1_results();
+    // print_pass1_results();
+
+    fclose(fp);
 
     return EXIT_SUCCESS;
 }
