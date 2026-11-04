@@ -1,3 +1,4 @@
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <iomanip>
@@ -6,6 +7,7 @@
 #include <optional>
 #include <string.h>
 #include <string>
+#include <unordered_set>
 
 /* 
  * Implement a two-pass linker.
@@ -18,24 +20,47 @@
  * file stream. 
  */
 
+#define MAX_DEF_IN_MODULE 16
+#define MAX_USE_IN_MODULE 16
+#define MACHINE_SIZE 512
+#define MAX_VALID_INT (1 << 30)
+#define MAX_SYM_LEN 16
+
 // File state
 FILE *fp;
 int linenum;
 int curr_line_offset;
-
-// Helpful in finding the EOF offset.
-int end_of_line_offset;
+int end_of_line_offset; // Helpful in finding the EOF offset.
 
 // Map module # -> module base, updated after first pass.
-std::map<int, int> module_base_table;
+std::map<int, int> module_to_base;
+
+std::map<std::string, int> symbol_to_module;
 
 // Map symbol -> absolute address, updated after first pass.
-std::map<std::string, int> symbol_table;
+std::map<std::string, int> symbol_to_addr;
 
 // Map symbol -> error messages from first pass.
 std::map<std::string, std::string> errors;
 
-int inst_num;
+// Symbols referenced by E instructions. For RULE 4.
+std::unordered_set<std::string> symbols_used_global;
+
+void parse_error(int errcode)
+{
+    std::vector<std::string> errmsg = {
+        "TOO_MANY_DEF_IN_MODULE",   // > 16
+        "TOO_MANY_USE_IN_MODULE",   // > 16
+        "TOO_MANY_INSTR",           // total num_instr exceeds memory size (512)
+        "NUM_EXPECTED",             // Number expect, anything >= 2^30 is not a number either
+        "SYM_EXPECTED",             // Symbol Expected
+        "MARIE_EXPECTED",           // Addressing Expected which is M/A/R/I/E
+        "SYM_TOO_LONG",             // Symbol Name is too long
+    };
+
+    std::cout << "Parse Error line " << linenum << " offset " << curr_line_offset << " : " << errmsg[errcode] << "\n";
+    exit(1);
+}
 
 /*
  * Read and return one token at a time from a file stream.
@@ -102,11 +127,24 @@ int readInt()
     char *tok = getToken();
 
     if (tok == nullptr) {
-        // EOF
-        return -1;
+        return -1;  // EOF
     }
 
-    return std::stoi(tok);
+    std::string s = tok;
+
+    for (char c : s) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) {
+            parse_error(3); // NUM_EXPECTED
+        }
+    }
+
+    int val = std::stoi(s);
+
+    if (val > MAX_VALID_INT) {
+        parse_error(3); // NUM_EXPECTED
+    }
+
+    return val;
 }
 
 // Read one symbol and return a string value.
@@ -120,6 +158,21 @@ std::optional<std::string> readSym()
     }
 
     std::string s = tok;
+
+    if (!std::isalpha(s[0])) {
+        parse_error(4); // SYM_EXPECTED
+    }
+
+    for (char c : s) {
+        if (!std::isalnum(c)) {
+            parse_error(4); // SYM_EXPECTED
+        }
+    }
+
+    if (s.size() > MAX_SYM_LEN) {
+       parse_error(6);
+    }
+    
     return s;
 }
 
@@ -132,6 +185,14 @@ std::optional<char> readMARIE()
     if (tok == nullptr) {
         // EOF
         return std::nullopt;
+    }
+
+    std::unordered_set<char> MARIE = {'M', 'A', 'R', 'I', 'E'};
+
+    auto it = MARIE.find(*tok);
+
+    if (it == MARIE.end()) {
+        parse_error(5); // Invalid address mode
     }
 
     return *tok;
@@ -147,10 +208,17 @@ void pass1()
 
     // One iteration corresponds to one module.
     while (true) {
+        std::vector<std::pair<std::string, int>> symbols_defined_in_module;
+
         int defcount = readInt();
 
         if (defcount < 0) {
+            // EOF
             return;
+        }
+
+        if (defcount > MAX_DEF_IN_MODULE) {
+            parse_error(0);
         }
 
         for (int i = 0; i < defcount; ++i) {
@@ -162,9 +230,9 @@ void pass1()
 
             int val = readInt();
 
-            auto it = symbol_table.find(sym);
+            auto it = symbol_to_addr.find(sym);
             
-            if (it != symbol_table.end()) {
+            if (it != symbol_to_addr.end()) {
                 // RULE 2
                 // If a symbol is defined multiple times,  
                 // print an error message and use the first definition.  
@@ -173,13 +241,23 @@ void pass1()
 
                 std::string msg = "Error: This variable is multiple times defined; first value used";
                 errors[sym] = msg;
+
+                // RULE 5
+                // If the symbol is a redefinition then print a warning message
+                std::cout << "Warning: Module " << module_num << ":" << sym << "redefinition ignored\n";
             }
             else {
-                symbol_table[sym] = module_base + val;
+                symbol_to_module[sym] = module_num;
+                symbol_to_addr[sym] = module_base + val;
+                symbols_defined_in_module.push_back({sym, val});
             }
         }
 
         int useCount = readInt();
+
+        if (useCount > MAX_USE_IN_MODULE) {
+            parse_error(1);
+        }
 
         for (int i = 0; i < useCount; ++i) {
             std::string sym = readSym().value_or("EOF");
@@ -191,18 +269,37 @@ void pass1()
 
         int instCount = readInt();
 
+        if (instCount > MACHINE_SIZE) {
+            parse_error(2);
+        }
+
         for (int i = 0; i < instCount; ++i) {
-            char addressMode = readMARIE().value_or('F');
+            char addressMode = readMARIE().value_or('x');
             
-            if (addressMode == 'F') {
-                // F means EOF
+            if (addressMode == 'x') {
+                // EOF
                 return;
             }
             
             int operand = readInt();
         }
 
-        module_base_table[module_num] = module_base;
+        for (auto [sym, val] : symbols_defined_in_module) {
+            if (val > instCount) {
+                // RULE 5
+                // If an address appearing in a first definition of a symbol 
+                // exceeds the size of the module, print a warning message 
+                // in pass1 after processing the module and 
+                // treat the address given as 0 (relative to the module).
+
+                symbol_to_addr[sym] = module_base;
+
+                std::cout << "Warning: Module " << module_num <<": " 
+                          << sym << "=" << val << " valid=[0.." << instCount << "] assume zero relative\n";
+            }
+        }
+
+        module_to_base[module_num] = module_base;
         ++module_num;
         module_base += instCount;
     }
@@ -231,7 +328,7 @@ void printSymbolTable()
 {
     std::cout << "Symbol Table\n";
 
-    for (auto [sym, addr] : symbol_table) {
+    for (auto [sym, addr] : symbol_to_addr) {
         std::cout << sym << "=" << addr;
 
         auto it = errors.find(sym);
@@ -245,69 +342,166 @@ void printSymbolTable()
     }
 }
 
-void printInst(int opcode, int operand)
+void printInst(int inst_num, int opcode, int operand, std::string error_msg)
 {
     std::string opcode_s = std::to_string(opcode);
     std::string operand_s = std::to_string(operand);
 
     std::cout << std::setfill('0') << std::setw(3) << std::to_string(inst_num) << ": "
               << std::to_string(opcode)
-              << std::setfill('0') << std::setw(3) << std::to_string(operand) << "\n";
+              << std::setfill('0') << std::setw(3) << std::to_string(operand) 
+              << " " << error_msg << "\n";
 }
 
-void processMARIE(char addressMode, int inst)
+void processMARIE(
+    int module_num, 
+    int module_size,
+    const std::vector<std::string>& symbols_in_use_list, 
+    std::unordered_set<int>& symbols_used_in_module, 
+    int inst_num, 
+    char addressMode, 
+    int inst
+)
 {
     int opcode = inst / 1000;
     int operand = inst % 10;
+    std::string error_msg = "";
+    
+    if (opcode >= 10) {
+        // RULE 11
+        // If an illegal opcode is encountered (i.e. op >= 10), 
+        // print an error and convert the <opcode,operand> to 9999.
+        opcode = 9;
+        operand = 999;
+        error_msg = "Error: Illegal opcode; treated as 9999";
+    }
 
     switch (addressMode) {
-        case 'M':
+        case 'M': {
             // Module addressing
             // Operand is the number of a valid module 
             // and is replaced with the base address of that module.
 
-            operand = module_base_table[operand];
-            printInst(opcode, operand);
-            break;
+            auto it = module_to_base.find(operand);
 
-        case 'A':
+            if (it == module_to_base.end()) {
+                // RULE 12
+                // If a module operand is invalid, print an error message and assume module 0.
+                operand = 0;
+
+                if (error_msg == "") {
+                    error_msg = "Error: Illegal module operand ; treated as module=0";
+                }
+            }
+            
+            operand = module_to_base[operand];
+            printInst(inst_num, opcode, operand, "");
+            break;
+        }
+        case 'A': {
             // Absolute addressing
             // Operand is an absolute address which will never be changed in pass2; 
             // however it can’t be “>=” the machine size (512).
+            if (operand > MACHINE_SIZE) {
+                // RULE 8
+                // If an absolute address exceeds the size of the machine, 
+                // print an error message and use the absolute value zero.
+                operand = 0;
 
+                if (error_msg == "") {
+                    error_msg = "Error: Absolute address exceeds machine size; zero used";
+                }
+            }
+
+            printInst(inst_num, opcode, operand, error_msg);
             break;
-
-        case 'R':
+        }
+        case 'R': {
             // Relative addressing
             // Replace the relative address with the absolute address,
-            // where absolute_addr = module_base+relative_addr. 
-            
-            break;
+            // where absolute_addr = module_base + relative_addr.
+            if (operand >= module_size) {
+                // RULE 9
+                // If a relative address exceeds the size of the module, 
+                // print an error message and use the module relative value zero.
+                // You still need to remap “0” to the correct absolute address).
+                operand = 0;
 
-        case 'I':
+                if (error_msg == "") {
+                    error_msg = "Error: Relative address exceeds module size; relative zero used";
+                }
+            }
+
+            operand = module_to_base[module_num] + operand;
+            printInst(inst_num, opcode, operand, error_msg);
+            break;
+        }
+        case 'I': {
             // Immediate addressing
             // Immediate operand is unchanged, but must be less than 900.
-            
-            break;
 
-        case 'E':
-            // External addressing
-            // Operand is an external address which is represented 
-            // as an index into the uselist.
-            
-            break;
+            // RULE 10
+            // If an illegal immediate operand (I) is encountered (i.e. >= 900), 
+            // print an error and convert the operand value to 999.
+            if (operand >= 900) {
+                operand = 999;
 
+                if (error_msg == "") {
+                    error_msg = "Error: Illegal immediate operand; treated as 999";
+                }
+            }
+
+            printInst(inst_num, opcode, operand, error_msg);
+            break;
+        }
+        case 'E': {
+            if (operand >= (int) symbols_in_use_list.size()) {
+                // RULE 6
+                // If an external operand is too large to reference an entry in the use list, 
+                // print an error message and treat the operand as relative=0.
+                operand = module_to_base[module_num];
+
+                if (error_msg == "") {
+                    error_msg = "Error: External operand exceeds length of uselist; treated as relative=0";
+                }
+            }
+            else {
+                std::string sym = symbols_in_use_list[operand];
+
+                symbols_used_in_module.insert(operand); // RULE 7
+
+                auto it = symbol_to_addr.find(sym);
+
+                if (it == symbol_to_addr.end()) {
+                    // RULE 3
+                    // If a symbol is used in an E-instruction but not defined anywhere, 
+                    // print an error message and use the value absolute zero.
+                    operand = 0;
+
+                    if (error_msg == "") {
+                        error_msg = "Error: " + sym + " is not defined; zero used";
+                    }
+                }
+                else {
+                    operand = it->second;
+                    symbols_used_global.insert(sym); // RULE 4
+                }
+            }
+
+            printInst(inst_num, opcode, operand, error_msg);
+            break;
+        }
         default:
-            // Invalid addressing mode
             break;
     }
-
-    ++inst_num;
 }
 
 void pass2()
 {
     std::cout << "Memory Map\n";
+
+    int module_num = 0;
+    int inst_num = 0;
 
     while (true) {
         int defcount = readInt();
@@ -327,6 +521,7 @@ void pass2()
         }
 
         int useCount = readInt();
+        std::vector<std::string> symbols_in_use_list;
 
         for (int i = 0; i < useCount; ++i) {
             std::string sym = readSym().value_or("EOF");
@@ -334,21 +529,65 @@ void pass2()
             if (sym == "EOF") {
                 return;
             }
+
+            symbols_in_use_list.push_back(sym);
         }
 
         int instCount = readInt();
+
+        // Indices of symbols used by an E instruction
+        // within this module.
+        // We need this information for RULE 7 to find out
+        // which symbols in the use list weren't actually used.
+        std::unordered_set<int> symbols_used_in_module;
 
         for (int i = 0; i < instCount; ++i) {
             char addressMode = readMARIE().value_or('F');
             
             if (addressMode == 'F') {
-                // F means EOF
+                // F here means EOF
                 return;
             }
             
             int inst = readInt();
 
-            processMARIE(addressMode, inst);
+            processMARIE(
+                module_num,
+                instCount, 
+                symbols_in_use_list, 
+                symbols_used_in_module, 
+                inst_num, 
+                addressMode, 
+                inst
+            );
+            
+            ++inst_num;
+        }
+
+        for (int i = 0; i < (int) symbols_in_use_list.size(); ++i) {
+            // RULE 7
+            auto it = symbols_used_in_module.find(i);
+
+            if (it == symbols_used_in_module.end()) {
+                std::cout << "Warning: Module " << module_num 
+                          << ": uselist[" << i << "]=" 
+                          << symbols_in_use_list[i] << "was not used\n";
+            }
+        }
+
+        ++module_num;
+    }
+
+    // RULE 4
+    // If a symbol is defined but never used globally by an E instruction, 
+    // print a warning message.
+    for (auto [sym, addr] : symbol_to_addr) {
+        auto it = symbols_used_global.find(sym);
+
+        if (it == symbols_used_global.end()) {
+            std::cout << "Warning: Module " 
+                      << symbol_to_module[sym] << ":" << sym
+                      << " was defined but never used\n";
         }
     }
 }
@@ -369,12 +608,21 @@ int main (int argc, char *argv[])
         return EXIT_FAILURE;
     }
     
-    pass1();
-    
+    pass1();   
     printSymbolTable();
 
-    pass2();
+    fclose(fp);
 
+    fp = fopen(filename, "r");
+
+    if (fp == nullptr) {
+        std::cout << "Failed to open file." << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    std::cout << "\n";
+    pass2();
+    
     fclose(fp);
 
     return EXIT_SUCCESS;
