@@ -20,11 +20,12 @@
  * The output file shows how symbols have been
  * resolved.
  *
- * The first pass scans the input file and builds:
- * 1. a module_base_table (maps module # to module base) and 
- * 2. a symbol_table (maps symbol to absolute address).
- *
- * The second pass resolves external symbol references.
+ * In the first pass, we build a symbol table and 
+ * determine the base address of each module based on its size. 
+ * 
+ * In the second pass, we rewrite some of the instructions, 
+ * relocating relative addresses and resolving external 
+ * symbol references. See `notes.md` for more details.
  * 
  * get_token() and readX are helper functions used in
  * both passes to consume and process one token at a time 
@@ -513,8 +514,6 @@ void processMARIE(
     }
 }
 
-// Process instructions.
-// Resolve symbols if necessary.
 void pass2()
 {
     std::cout << "Memory Map\n";
